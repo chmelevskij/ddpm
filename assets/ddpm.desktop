@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=DDPM
+GenericName=Monitor Control
+Comment=Adjust brightness, contrast and input source of DDC/CI monitors
+Exec=ddpm
+Icon=video-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=monitor;brightness;contrast;ddc;ddcci;display;input;
+StartupNotify=true
+StartupWMClass=ddpm
