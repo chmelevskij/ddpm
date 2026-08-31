@@ -1,5 +1,9 @@
 [workspace]
 # Binary app: release on GitHub only, never to crates.io.
 publish = false
+# Not on crates.io: use git tags (v0.1.0, …) as the released-version baseline.
+git_only = true
+# 0.x crate: still bump minor for feat: commits (matches the README table).
+features_always_increment_minor = true
 changelog_update = true
 git_release_enable = true
