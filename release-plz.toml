@@ -1,0 +1,5 @@
+[workspace]
+# Binary app: release on GitHub only, never to crates.io.
+publish = false
+changelog_update = true
+git_release_enable = true

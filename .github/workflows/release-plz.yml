@@ -1,0 +1,64 @@
+name: Release-plz
+
+permissions:
+  pull-requests: write
+  contents: write
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # Opens/updates the release PR (version bump + changelog) from conventional commits.
+  release-plz-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Tags and creates the GitHub release for merged release PRs (or the first, untagged version),
+  # then builds the Linux binary and attaches it to that release.
+  release-plz-release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz release
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and attach Linux binary
+        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+          cargo build --release --locked
+          TAG=$(echo "$RELEASES" | jq -r '.[0].tag')
+          VERSION=${TAG#v}
+          STAGE="ddpm-${VERSION}-x86_64-unknown-linux-gnu"
+          mkdir "$STAGE"
+          cp target/release/ddpm assets/ddpm.desktop README.md "$STAGE"/
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          gh release upload "$TAG" "$STAGE.tar.gz" "$STAGE.tar.gz.sha256"
