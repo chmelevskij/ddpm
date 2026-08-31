@@ -39,9 +39,9 @@ release:
 run *ARGS:
     cargo run -- {{ARGS}}
 
-# Run with verbose logging from ddc-hi / eframe (needs a logger in main.rs to show anything)
+# Run with debug logging from the app and the DDC stack
 run-debug *ARGS:
-    RUST_LOG=debug,wgpu=warn,naga=warn cargo run -- {{ARGS}}
+    RUST_LOG=warn,ddpm=debug,ddc_hi=debug,ddc_i2c=debug cargo run -- {{ARGS}}
 
 # Run tests
 test:
