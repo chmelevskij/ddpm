@@ -131,29 +131,29 @@ fn themed_visuals(theme: egui::Theme) -> egui::Visuals {
     if theme == Theme::Dark {
         v.panel_fill = Color32::from_rgb(0x16, 0x18, 0x1D); // page
         v.window_fill = Color32::from_rgb(0x1F, 0x23, 0x2B); // cards
-        v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x30, 0x35, 0x40));
+        v.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x30, 0x35, 0x40));
         v.extreme_bg_color = Color32::from_rgb(0x12, 0x14, 0x18); // slider rail / text edits
         v.faint_bg_color = Color32::from_rgb(0x26, 0x2B, 0x33);
         v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x2A, 0x30, 0x3A); // buttons
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x34, 0x3B, 0x47);
         v.widgets.active.weak_bg_fill = Color32::from_rgb(0x3D, 0x45, 0x53);
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x3A, 0x40, 0x4C));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x3A, 0x40, 0x4C));
     } else {
         v.panel_fill = Color32::from_rgb(0xEE, 0xF0, 0xF3);
         v.window_fill = Color32::WHITE;
-        v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0xD8, 0xDC, 0xE2));
+        v.window_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0xD8, 0xDC, 0xE2));
         v.extreme_bg_color = Color32::from_rgb(0xE6, 0xE9, 0xEE);
         v.faint_bg_color = Color32::from_rgb(0xF3, 0xF5, 0xF8);
         v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xF7, 0xF8, 0xFA);
         v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xEC, 0xEF, 0xF3);
         v.widgets.active.weak_bg_fill = Color32::from_rgb(0xE2, 0xE6, 0xEC);
-        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xC9, 0xCE, 0xD6));
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0xC9, 0xCE, 0xD6));
     }
     v.selection.bg_fill = ACCENT;
     v.hyperlink_color = ACCENT;
     v.slider_trailing_fill = true;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.9));
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT.gamma_multiply(0.9));
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     let r = CornerRadius::same(6);
     v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.corner_radius = r;
@@ -177,7 +177,7 @@ fn apply_style(ctx: &egui::Context) {
 fn notice_frame(ui: &mut egui::Ui, color: egui::Color32, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.12))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.35)))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.35)))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(10))
         .show(ui, |ui| {
