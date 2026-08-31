@@ -73,3 +73,7 @@ to the [GitHub release](https://github.com/chmelevskij/ddpm/releases).
 | `feat:` | minor release |
 | `feat!:` / `BREAKING CHANGE:` | major release |
 | `docs:` `ci:` `chore:` `refactor:` `test:` | no release on their own |
+
+## License
+
+[MIT](LICENSE)
