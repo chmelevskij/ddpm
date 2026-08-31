@@ -17,6 +17,7 @@ Monitor control for Linux — adjust **brightness**, **contrast** and **input so
 
 - Per-monitor brightness and contrast sliders — writes are throttled and coalesced, and the UI never blocks on the slow DDC/i2c protocol (all I/O runs on a worker thread)
 - Input-source switching (DisplayPort / HDMI / USB-C / …) — the list comes from the monitor's own capabilities, and switching is a deliberate two-step action with read-back
+- System tray icon (StatusNotifierItem, like the network/volume applets): scroll on it to adjust brightness, switch inputs straight from its menu, and closing the window hides to the tray — quit from the tray menu or with Ctrl+Q (on Wayland, restore the window from the taskbar; compositors don't let apps unminimize themselves)
 - Rescan for hot-plugged monitors; values re-read on window focus, so changes made via the monitor OSD or `ddcutil` stay in sync
 - Failed reads/writes are surfaced per monitor instead of silently ignored; misbehaving monitors get locked out after repeated failures with a Retry
 - Monitors identified by model, serial and `/dev/i2c-N`

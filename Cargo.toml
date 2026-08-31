@@ -11,6 +11,7 @@ eframe = "0.31"
 ddc-hi = "0.4"
 env_logger = "0.11"
 log = "0.4"
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 
 [profile.release]
 strip = true

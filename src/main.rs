@@ -607,6 +607,177 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
 
 // ───────────────────────── UI ─────────────────────────
 
+// ───────────────────────── system tray ─────────────────────────
+
+/// Brightness change per scroll-wheel notch on the tray icon, in VCP units.
+const SCROLL_BRIGHTNESS_STEP: i32 = 5;
+
+/// Normalize an SNI scroll delta to wheel notches (Plasma sends ±120 per notch,
+/// other environments may send single units).
+fn scroll_notches(delta: i32) -> i32 {
+    if delta.abs() >= 120 {
+        delta / 120
+    } else {
+        delta.signum()
+    }
+}
+
+/// Snapshot of one monitor shown in the tray menu.
+#[derive(Clone, PartialEq)]
+struct TrayMonitor {
+    name: String,
+    input: Option<u8>,
+    inputs: Vec<InputOption>,
+}
+
+/// Actions triggered from the tray icon, handled on the UI thread.
+enum TrayEvent {
+    ToggleWindow,
+    Rescan,
+    SetInput {
+        idx: usize,
+        code: u8,
+    },
+    /// Adjust brightness on all monitors by this many VCP units (scroll wheel).
+    BrightnessDelta(i32),
+    Quit,
+}
+
+/// StatusNotifierItem — the KDE/freedesktop tray protocol, the same one the
+/// network/volume icons use. ksni runs this on its own service thread; every
+/// interaction is forwarded to the UI thread as a [`TrayEvent`].
+struct DdpmTray {
+    events: Sender<TrayEvent>,
+    ctx: egui::Context,
+    monitors: Vec<TrayMonitor>,
+    hidden: bool,
+}
+
+impl DdpmTray {
+    fn emit(&self, event: TrayEvent) {
+        let _ = self.events.send(event);
+        // Wake the UI event loop so the event is handled promptly.
+        self.ctx.request_repaint();
+    }
+}
+
+impl ksni::Tray for DdpmTray {
+    fn id(&self) -> String {
+        APP_ID.into()
+    }
+
+    fn title(&self) -> String {
+        "DDPM".into()
+    }
+
+    fn icon_name(&self) -> String {
+        "video-display".into()
+    }
+
+    fn category(&self) -> ksni::Category {
+        ksni::Category::Hardware
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            icon_name: String::new(),
+            icon_pixmap: Vec::new(),
+            title: "DDPM — Monitor Control".into(),
+            description: "Scroll to adjust brightness".into(),
+        }
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.emit(TrayEvent::ToggleWindow);
+    }
+
+    fn scroll(&mut self, delta: i32, orientation: ksni::Orientation) {
+        if orientation == ksni::Orientation::Vertical && delta != 0 {
+            self.emit(TrayEvent::BrightnessDelta(
+                scroll_notches(delta) * SCROLL_BRIGHTNESS_STEP,
+            ));
+        }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
+
+        let mut items: Vec<ksni::MenuItem<Self>> = vec![
+            StandardItem {
+                label: if self.hidden {
+                    "Show Window"
+                } else {
+                    "Hide to Tray"
+                }
+                .into(),
+                icon_name: "video-display".into(),
+                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::ToggleWindow)),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+        ];
+        let mut any_inputs = false;
+        for (idx, m) in self.monitors.iter().enumerate() {
+            // Input switching straight from the tray, one submenu per monitor.
+            let Some(input) = m.input else { continue };
+            let Some(selected) = m.inputs.iter().position(|o| o.code == input) else {
+                continue;
+            };
+            any_inputs = true;
+            let codes: Vec<u8> = m.inputs.iter().map(|o| o.code).collect();
+            items.push(
+                SubMenu {
+                    label: m.name.clone(),
+                    submenu: vec![
+                        RadioGroup {
+                            selected,
+                            select: Box::new(move |tray: &mut Self, i| {
+                                if let Some(&code) = codes.get(i) {
+                                    tray.emit(TrayEvent::SetInput { idx, code });
+                                }
+                            }),
+                            options: m
+                                .inputs
+                                .iter()
+                                .map(|o| RadioItem {
+                                    label: o.label.clone(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        }
+                        .into(),
+                    ],
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
+        if any_inputs {
+            items.push(ksni::MenuItem::Separator);
+        }
+        items.push(
+            StandardItem {
+                label: "Rescan Monitors".into(),
+                icon_name: "view-refresh".into(),
+                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::Rescan)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(
+            StandardItem {
+                label: "Quit".into(),
+                icon_name: "application-exit".into(),
+                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::Quit)),
+                ..Default::default()
+            }
+            .into(),
+        );
+        items
+    }
+}
+
 struct App {
     cmd_tx: Sender<Cmd>,
     msg_rx: Receiver<Msg>,
@@ -616,6 +787,14 @@ struct App {
     worker_error: Option<String>,
     was_focused: bool,
     last_read: Instant,
+    tray: Option<ksni::blocking::Handle<DdpmTray>>,
+    tray_rx: Receiver<TrayEvent>,
+    /// Last (monitors, hidden) pushed to the tray, to skip needless D-Bus updates.
+    tray_state: (Vec<TrayMonitor>, bool),
+    /// Window is (believed to be) minimized to the tray.
+    hidden: bool,
+    /// A real quit was requested (Ctrl+Q or tray menu); don't intercept the close.
+    quit: bool,
 }
 
 impl App {
@@ -628,6 +807,24 @@ impl App {
             .name("ddc-worker".into())
             .spawn(move || worker(cmd_rx, msg_tx, ctx))
             .expect("failed to spawn DDC worker thread");
+        let (tray_tx, tray_rx) = mpsc::channel();
+        let tray = {
+            use ksni::blocking::TrayMethods;
+            let tray = DdpmTray {
+                events: tray_tx,
+                ctx: cc.egui_ctx.clone(),
+                monitors: Vec::new(),
+                hidden: false,
+            };
+            match tray.spawn() {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    // No StatusNotifier host (or no D-Bus): run without a tray.
+                    log::warn!("system tray unavailable: {err}");
+                    None
+                }
+            }
+        };
         Self {
             cmd_tx,
             msg_rx,
@@ -637,6 +834,112 @@ impl App {
             worker_error: None,
             was_focused: true,
             last_read: Instant::now(),
+            tray,
+            tray_rx,
+            tray_state: (Vec::new(), false),
+            hidden: false,
+            quit: false,
+        }
+    }
+
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.tray_rx.try_recv() {
+            match event {
+                TrayEvent::ToggleWindow => self.set_hidden(ctx, !self.hidden),
+                TrayEvent::Rescan => self.send(Cmd::Rescan),
+                TrayEvent::SetInput { idx, code } => {
+                    let switch = self.monitors.get_mut(idx).is_some_and(|m| {
+                        if m.input == Some(code) {
+                            false
+                        } else {
+                            m.pending_input = Some(code);
+                            true
+                        }
+                    });
+                    if switch {
+                        self.send(Cmd::Set {
+                            idx,
+                            code: VCP_INPUT_SOURCE,
+                            value: u16::from(code),
+                        });
+                    }
+                }
+                TrayEvent::BrightnessDelta(delta) => self.nudge_brightness(delta),
+                TrayEvent::Quit => {
+                    self.quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn set_hidden(&mut self, ctx: &egui::Context, hidden: bool) {
+        if hidden {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        } else {
+            // Wayland cannot unminimize a window programmatically (winit
+            // limitation), so also request attention to highlight the taskbar
+            // entry; the direct route works on X11 and other backends.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
+        self.hidden = hidden;
+    }
+
+    /// Scroll on the tray icon: step brightness on every monitor, using the
+    /// same commit bookkeeping as the slider.
+    fn nudge_brightness(&mut self, delta: i32) {
+        let now = Instant::now();
+        let mut cmds = Vec::new();
+        for (idx, m) in self.monitors.iter_mut().enumerate() {
+            let Some(c) = m.brightness.as_mut() else {
+                continue;
+            };
+            let target = (i32::from(c.value) + delta).clamp(0, i32::from(c.max)) as u16;
+            c.value = target;
+            let stale = c.value != c.applied || c.last_sent_value.is_some_and(|v| v != c.value);
+            if stale && c.last_sent_value != Some(c.value) {
+                c.last_sent_value = Some(c.value);
+                c.last_sent_at = Some(now);
+                cmds.push(Cmd::Set {
+                    idx,
+                    code: VCP_BRIGHTNESS,
+                    value: c.value,
+                });
+            }
+        }
+        for cmd in cmds {
+            self.send(cmd);
+        }
+    }
+
+    /// Push monitor/window state to the tray menu when it changed.
+    fn sync_tray(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        let monitors: Vec<TrayMonitor> = self
+            .monitors
+            .iter()
+            .map(|m| TrayMonitor {
+                name: m.name.clone(),
+                input: m.input,
+                inputs: m.input_options(),
+            })
+            .collect();
+        if self.tray_state.0 != monitors || self.tray_state.1 != self.hidden {
+            let snapshot = monitors.clone();
+            let hidden = self.hidden;
+            let alive = tray
+                .update(move |t| {
+                    t.monitors = snapshot;
+                    t.hidden = hidden;
+                })
+                .is_some();
+            if alive {
+                self.tray_state = (monitors, hidden);
+            }
         }
     }
 
@@ -890,6 +1193,15 @@ fn monitor_ui(
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages();
+        self.handle_tray_events(ctx);
+        self.sync_tray();
+
+        // With a tray icon present, closing the window hides it to the tray
+        // instead of quitting; quit via Ctrl+Q or the tray menu.
+        if !self.quit && self.tray.is_some() && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.set_hidden(ctx, true);
+        }
 
         // Re-read values when the window regains focus (OSD / other tools may have changed them).
         let focused = ctx.input(|i| i.focused);
@@ -902,9 +1214,14 @@ impl eframe::App for App {
             self.send(Cmd::Reload);
         }
         self.was_focused = focused;
+        if focused {
+            // The user restored the window (taskbar or otherwise).
+            self.hidden = false;
+        }
 
         let quit = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
         if ctx.input_mut(|i| i.consume_shortcut(&quit)) {
+            self.quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
@@ -996,11 +1313,32 @@ impl eframe::App for App {
             self.send(cmd);
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(tray) = self.tray.take() {
+            tray.shutdown().wait();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_deltas_normalize_to_notches() {
+        for (delta, notches) in [
+            (120, 1),
+            (-120, -1),
+            (240, 2),
+            (-360, -3),
+            (1, 1),
+            (-3, -1),
+            (0, 0),
+        ] {
+            assert_eq!(scroll_notches(delta), notches, "delta {delta}");
+        }
+    }
 
     #[test]
     fn input_labels() {
