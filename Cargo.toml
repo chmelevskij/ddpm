@@ -11,7 +11,12 @@ eframe = "0.31"
 ddc-hi = "0.4"
 env_logger = "0.11"
 log = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
 
 [profile.release]
 strip = true

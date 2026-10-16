@@ -4,12 +4,15 @@
 //! display handles; the UI thread only exchanges messages with it, so the
 //! window never blocks on the (slow, sleep-heavy) i2c protocol.
 
+mod tray;
+
 use ddc_hi::{Ddc, Display, FeatureCode, Handle, VcpValue};
 use eframe::egui;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use tray::{Tray, TrayEvent, TrayMonitor};
 
 /// Wayland app id; must match the desktop file name (`ddpm.desktop`).
 const APP_ID: &str = "ddpm";
@@ -70,6 +73,14 @@ fn feature_name(code: FeatureCode) -> &'static str {
         _ => "feature",
     }
 }
+
+#[cfg(target_os = "macos")]
+const NO_MONITORS_HINT: &str = "No DDC/CI capable monitors found. Make sure DDC/CI is enabled in \
+     the monitor's on-screen menu. On Apple Silicon Macs the built-in HDMI port often doesn't \
+     pass DDC; USB-C / DisplayPort connections usually do.";
+#[cfg(not(target_os = "macos"))]
+const NO_MONITORS_HINT: &str = "No DDC/CI capable monitors found. i2c-dev must be loaded and your \
+     user needs access to /dev/i2c-* (group `i2c`); `just doctor` checks both.";
 
 /// ddc-hi reports a Linux display's id as the decimal `rdev` of its device node.
 /// Turn that back into `/dev/i2c-N` (i2c-dev is char major 89).
@@ -312,7 +323,9 @@ impl MonitorState {
         let ident = [
             info.manufacturer_id.clone(),
             info.serial_number.clone().map(|s| format!("S/N {s}")),
-            Some(i2c_device_path(&info.id).unwrap_or_else(|| format!("id {}", info.id))),
+            // On macOS the id is just the product name again, so leave it out there.
+            i2c_device_path(&info.id)
+                .or_else(|| cfg!(not(target_os = "macos")).then(|| format!("id {}", info.id))),
         ]
         .into_iter()
         .flatten()
@@ -578,11 +591,7 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
             m.input.map(input_label)
         );
     }
-    let error = displays.is_empty().then(|| {
-        "No DDC/CI capable monitors found. i2c-dev must be loaded and your user needs \
-         access to /dev/i2c-* (group `i2c`); `just doctor` checks both."
-            .to_string()
-    });
+    let error = displays.is_empty().then(|| NO_MONITORS_HINT.to_string());
     if !post(Msg::Scanned { monitors, error }) {
         return displays;
     }
@@ -607,177 +616,6 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
 
 // ───────────────────────── UI ─────────────────────────
 
-// ───────────────────────── system tray ─────────────────────────
-
-/// Brightness change per scroll-wheel notch on the tray icon, in VCP units.
-const SCROLL_BRIGHTNESS_STEP: i32 = 5;
-
-/// Normalize an SNI scroll delta to wheel notches (Plasma sends ±120 per notch,
-/// other environments may send single units).
-fn scroll_notches(delta: i32) -> i32 {
-    if delta.abs() >= 120 {
-        delta / 120
-    } else {
-        delta.signum()
-    }
-}
-
-/// Snapshot of one monitor shown in the tray menu.
-#[derive(Clone, PartialEq)]
-struct TrayMonitor {
-    name: String,
-    input: Option<u8>,
-    inputs: Vec<InputOption>,
-}
-
-/// Actions triggered from the tray icon, handled on the UI thread.
-enum TrayEvent {
-    ToggleWindow,
-    Rescan,
-    SetInput {
-        idx: usize,
-        code: u8,
-    },
-    /// Adjust brightness on all monitors by this many VCP units (scroll wheel).
-    BrightnessDelta(i32),
-    Quit,
-}
-
-/// StatusNotifierItem — the KDE/freedesktop tray protocol, the same one the
-/// network/volume icons use. ksni runs this on its own service thread; every
-/// interaction is forwarded to the UI thread as a [`TrayEvent`].
-struct DdpmTray {
-    events: Sender<TrayEvent>,
-    ctx: egui::Context,
-    monitors: Vec<TrayMonitor>,
-    hidden: bool,
-}
-
-impl DdpmTray {
-    fn emit(&self, event: TrayEvent) {
-        let _ = self.events.send(event);
-        // Wake the UI event loop so the event is handled promptly.
-        self.ctx.request_repaint();
-    }
-}
-
-impl ksni::Tray for DdpmTray {
-    fn id(&self) -> String {
-        APP_ID.into()
-    }
-
-    fn title(&self) -> String {
-        "DDPM".into()
-    }
-
-    fn icon_name(&self) -> String {
-        "video-display".into()
-    }
-
-    fn category(&self) -> ksni::Category {
-        ksni::Category::Hardware
-    }
-
-    fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip {
-            icon_name: String::new(),
-            icon_pixmap: Vec::new(),
-            title: "DDPM — Monitor Control".into(),
-            description: "Scroll to adjust brightness".into(),
-        }
-    }
-
-    fn activate(&mut self, _x: i32, _y: i32) {
-        self.emit(TrayEvent::ToggleWindow);
-    }
-
-    fn scroll(&mut self, delta: i32, orientation: ksni::Orientation) {
-        if orientation == ksni::Orientation::Vertical && delta != 0 {
-            self.emit(TrayEvent::BrightnessDelta(
-                scroll_notches(delta) * SCROLL_BRIGHTNESS_STEP,
-            ));
-        }
-    }
-
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
-
-        let mut items: Vec<ksni::MenuItem<Self>> = vec![
-            StandardItem {
-                label: if self.hidden {
-                    "Show Window"
-                } else {
-                    "Hide to Tray"
-                }
-                .into(),
-                icon_name: "video-display".into(),
-                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::ToggleWindow)),
-                ..Default::default()
-            }
-            .into(),
-            ksni::MenuItem::Separator,
-        ];
-        let mut any_inputs = false;
-        for (idx, m) in self.monitors.iter().enumerate() {
-            // Input switching straight from the tray, one submenu per monitor.
-            let Some(input) = m.input else { continue };
-            let Some(selected) = m.inputs.iter().position(|o| o.code == input) else {
-                continue;
-            };
-            any_inputs = true;
-            let codes: Vec<u8> = m.inputs.iter().map(|o| o.code).collect();
-            items.push(
-                SubMenu {
-                    label: m.name.clone(),
-                    submenu: vec![
-                        RadioGroup {
-                            selected,
-                            select: Box::new(move |tray: &mut Self, i| {
-                                if let Some(&code) = codes.get(i) {
-                                    tray.emit(TrayEvent::SetInput { idx, code });
-                                }
-                            }),
-                            options: m
-                                .inputs
-                                .iter()
-                                .map(|o| RadioItem {
-                                    label: o.label.clone(),
-                                    ..Default::default()
-                                })
-                                .collect(),
-                        }
-                        .into(),
-                    ],
-                    ..Default::default()
-                }
-                .into(),
-            );
-        }
-        if any_inputs {
-            items.push(ksni::MenuItem::Separator);
-        }
-        items.push(
-            StandardItem {
-                label: "Rescan Monitors".into(),
-                icon_name: "view-refresh".into(),
-                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::Rescan)),
-                ..Default::default()
-            }
-            .into(),
-        );
-        items.push(
-            StandardItem {
-                label: "Quit".into(),
-                icon_name: "application-exit".into(),
-                activate: Box::new(|tray: &mut Self| tray.emit(TrayEvent::Quit)),
-                ..Default::default()
-            }
-            .into(),
-        );
-        items
-    }
-}
-
 struct App {
     cmd_tx: Sender<Cmd>,
     msg_rx: Receiver<Msg>,
@@ -787,9 +625,9 @@ struct App {
     worker_error: Option<String>,
     was_focused: bool,
     last_read: Instant,
-    tray: Option<ksni::blocking::Handle<DdpmTray>>,
+    tray: Option<Tray>,
     tray_rx: Receiver<TrayEvent>,
-    /// Last (monitors, hidden) pushed to the tray, to skip needless D-Bus updates.
+    /// Last (monitors, hidden) pushed to the tray, to skip needless menu rebuilds.
     tray_state: (Vec<TrayMonitor>, bool),
     /// Window is (believed to be) minimized to the tray.
     hidden: bool,
@@ -808,23 +646,7 @@ impl App {
             .spawn(move || worker(cmd_rx, msg_tx, ctx))
             .expect("failed to spawn DDC worker thread");
         let (tray_tx, tray_rx) = mpsc::channel();
-        let tray = {
-            use ksni::blocking::TrayMethods;
-            let tray = DdpmTray {
-                events: tray_tx,
-                ctx: cc.egui_ctx.clone(),
-                monitors: Vec::new(),
-                hidden: false,
-            };
-            match tray.spawn() {
-                Ok(handle) => Some(handle),
-                Err(err) => {
-                    // No StatusNotifier host (or no D-Bus): run without a tray.
-                    log::warn!("system tray unavailable: {err}");
-                    None
-                }
-            }
-        };
+        let tray = Tray::spawn(tray_tx, cc.egui_ctx.clone());
         Self {
             cmd_tx,
             msg_rx,
@@ -882,6 +704,7 @@ impl App {
             // entry; the direct route works on X11 and other backends.
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            #[cfg(not(target_os = "macos"))]
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
@@ -928,18 +751,10 @@ impl App {
                 inputs: m.input_options(),
             })
             .collect();
-        if self.tray_state.0 != monitors || self.tray_state.1 != self.hidden {
-            let snapshot = monitors.clone();
-            let hidden = self.hidden;
-            let alive = tray
-                .update(move |t| {
-                    t.monitors = snapshot;
-                    t.hidden = hidden;
-                })
-                .is_some();
-            if alive {
-                self.tray_state = (monitors, hidden);
-            }
+        if (self.tray_state.0 != monitors || self.tray_state.1 != self.hidden)
+            && tray.update(&monitors, self.hidden)
+        {
+            self.tray_state = (monitors, self.hidden);
         }
     }
 
@@ -1316,7 +1131,7 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(tray) = self.tray.take() {
-            tray.shutdown().wait();
+            tray.shutdown();
         }
     }
 }
@@ -1324,21 +1139,6 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scroll_deltas_normalize_to_notches() {
-        for (delta, notches) in [
-            (120, 1),
-            (-120, -1),
-            (240, 2),
-            (-360, -3),
-            (1, 1),
-            (-3, -1),
-            (0, 0),
-        ] {
-            assert_eq!(scroll_notches(delta), notches, "delta {delta}");
-        }
-    }
 
     #[test]
     fn input_labels() {

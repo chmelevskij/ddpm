@@ -1,4 +1,4 @@
-# ddpm — DDC/CI monitor control (brightness / contrast / input) for Linux
+# ddpm — DDC/CI monitor control (brightness / contrast / input) for Linux and macOS
 #
 # `just`            list recipes
 # `just install`    build + install for the current user (no sudo)
@@ -101,6 +101,34 @@ install-system: release
 uninstall-system:
     sudo rm -f "{{sys_prefix}}/bin/{{bin}}" "{{sys_prefix}}/share/applications/{{bin}}.desktop"
     -sudo update-desktop-database "{{sys_prefix}}/share/applications" 2>/dev/null
+
+# ── macOS ────────────────────────────────────────────────────────────────────
+
+# Build a universal (Apple Silicon + Intel) DDPM.app → target/macos/DDPM.app
+macos-app:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        cargo build --release --locked --target "$t"
+    done
+    app=target/macos/DDPM.app
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS"
+    lipo -create -output "$app/Contents/MacOS/{{bin}}" \
+        target/aarch64-apple-darwin/release/{{bin}} target/x86_64-apple-darwin/release/{{bin}}
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    sed "s/@VERSION@/$version/g" assets/macos/Info.plist > "$app/Contents/Info.plist"
+    # ad-hoc signature: required to run on Apple Silicon, not a Developer ID
+    codesign --force --deep --sign - "$app"
+    echo "Built $app ($version)"
+
+# Install DDPM.app into ~/Applications
+install-macos: macos-app
+    mkdir -p ~/Applications
+    rm -rf ~/Applications/DDPM.app
+    cp -R target/macos/DDPM.app ~/Applications/
+    @echo "Installed ~/Applications/DDPM.app"
 
 # ── System setup (Debian/Ubuntu) ─────────────────────────────────────────────
 

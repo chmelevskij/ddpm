@@ -29,10 +29,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Tags and creates the GitHub release for merged release PRs (or the first, untagged version),
-  # then builds the Linux binary and attaches it to that release.
+  # then builds the Linux binary and attaches it to that release (macOS: see below).
   release-plz-release:
     name: Release
     runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,3 +65,32 @@ jobs:
           tar czf "$STAGE.tar.gz" "$STAGE"
           sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
           gh release upload "$TAG" "$STAGE.tar.gz" "$STAGE.tar.gz.sha256"
+
+  # Universal (Apple Silicon + Intel) DDPM.app, ad-hoc signed, zipped onto the same release.
+  macos-app:
+    name: macOS app
+    needs: release-plz-release
+    if: ${{ needs.release-plz-release.outputs.releases_created == 'true' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: taiki-e/install-action@just
+      - name: Build and attach DDPM.app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          TAG=$(echo "$RELEASES" | jq -r '.[0].tag')
+          VERSION=${TAG#v}
+          git checkout "$TAG"
+          just macos-app
+          ZIP="ddpm-${VERSION}-universal-apple-darwin.zip"
+          ditto -c -k --keepParent target/macos/DDPM.app "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+          gh release upload "$TAG" "$ZIP" "$ZIP.sha256"
