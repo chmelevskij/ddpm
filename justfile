@@ -76,6 +76,7 @@ clean:
 # ── Install / uninstall ──────────────────────────────────────────────────────
 
 # Install for the current user: binary → ~/.cargo/bin, launcher → ~/.local/share/applications
+[linux]
 install:
     cargo install --path . --locked --target-dir target --root "{{install_root}}"
     install -Dm644 assets/{{bin}}.desktop "{{appdir}}/{{bin}}.desktop"
@@ -85,12 +86,14 @@ install:
     @command -v {{bin}} >/dev/null || echo "note: {{bindir}} is not on your PATH"
 
 # Remove the user install
+[linux]
 uninstall:
     -cargo uninstall {{bin}} --root "{{install_root}}"
     rm -f "{{appdir}}/{{bin}}.desktop"
     -update-desktop-database "{{appdir}}" 2>/dev/null
 
 # Install system-wide (sudo): binary → /usr/local/bin, launcher → /usr/local/share/applications
+[linux]
 install-system: release
     sudo install -Dm755 target/release/{{bin}} "{{sys_prefix}}/bin/{{bin}}"
     sudo install -Dm644 assets/{{bin}}.desktop "{{sys_prefix}}/share/applications/{{bin}}.desktop"
@@ -98,6 +101,7 @@ install-system: release
     -sudo update-desktop-database "{{sys_prefix}}/share/applications" 2>/dev/null
 
 # Remove the system-wide install
+[linux]
 uninstall-system:
     sudo rm -f "{{sys_prefix}}/bin/{{bin}}" "{{sys_prefix}}/share/applications/{{bin}}.desktop"
     -sudo update-desktop-database "{{sys_prefix}}/share/applications" 2>/dev/null
@@ -122,6 +126,15 @@ macos-app:
     # ad-hoc signature: required to run on Apple Silicon, not a Developer ID
     codesign --force --deep --sign - "$app"
     echo "Built $app ($version)"
+
+# Install for the current user: DDPM.app → ~/Applications
+[macos]
+install: install-macos
+
+# Remove the user install
+[macos]
+uninstall:
+    rm -rf ~/Applications/DDPM.app
 
 # Install DDPM.app into ~/Applications
 install-macos: macos-app

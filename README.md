@@ -46,15 +46,11 @@ does not pass DDC; USB-C / DisplayPort connections do.
 Requires Rust, [`just`](https://github.com/casey/just), and on Debian/Ubuntu: `pkg-config` and `libudev-dev` (`just deps`).
 
 ```sh
-just install     # cargo install + desktop entry for the current user (no sudo)
+just install     # Linux: cargo install + desktop entry; macOS: universal DDPM.app into ~/Applications
 just uninstall   # remove it again
 ```
 
-On macOS, with Rust and `just` installed:
-
-```sh
-just install-macos   # builds a universal DDPM.app into ~/Applications
-```
+`just install-system` / `just uninstall-system` (sudo, `/usr/local`) are Linux-only.
 
 ## First-time system setup (Linux)
 
