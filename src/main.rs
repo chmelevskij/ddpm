@@ -437,6 +437,16 @@ impl MonitorState {
         }
         options
     }
+
+    /// The option after the selected one (pending, else current), wrapping around;
+    /// `None` if the input is unreadable or there is nothing to switch to.
+    fn next_input(&self) -> Option<u8> {
+        let selected = self.pending_input.or(self.input)?;
+        let options = self.input_options();
+        let pos = options.iter().position(|o| o.code == selected)?;
+        let next = options[(pos + 1) % options.len()].code;
+        (next != selected).then_some(next)
+    }
 }
 
 // ───────────────────────── Worker thread ─────────────────────────
@@ -616,6 +626,14 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
 
 // ───────────────────────── UI ─────────────────────────
 
+/// Cmd+N (macOS) / Ctrl+N switches the Nth monitor to its next input.
+fn input_shortcut(idx: usize) -> Option<egui::KeyboardShortcut> {
+    use egui::Key::*;
+    const KEYS: [egui::Key; 9] = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
+    KEYS.get(idx)
+        .map(|&key| egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+}
+
 struct App {
     cmd_tx: Sender<Cmd>,
     msg_rx: Receiver<Msg>,
@@ -737,6 +755,27 @@ impl App {
         for cmd in cmds {
             self.send(cmd);
         }
+    }
+
+    /// Keyboard shortcut: switch a monitor straight to its next input (no
+    /// separate Switch click, unlike the dropdown).
+    fn cycle_input(&mut self, idx: usize) {
+        if self.scanning {
+            return;
+        }
+        let Some(m) = self.monitors.get_mut(idx) else {
+            return;
+        };
+        if m.failures >= MAX_FAILURES {
+            return;
+        }
+        let Some(code) = m.next_input() else { return };
+        m.pending_input = Some(code);
+        self.send(Cmd::Set {
+            idx,
+            code: VCP_INPUT_SOURCE,
+            value: u16::from(code),
+        });
     }
 
     /// Push monitor/window state to the tray menu when it changed.
@@ -971,6 +1010,10 @@ fn monitor_ui(
                                     value: selected as u16,
                                 });
                             }
+                            if let Some(shortcut) = input_shortcut(idx) {
+                                ui.weak(ui.ctx().format_shortcut(&shortcut))
+                                    .on_hover_text("Switch to the next input");
+                            }
                         }
                     });
                     ui.end_row();
@@ -1038,6 +1081,14 @@ impl eframe::App for App {
         if ctx.input_mut(|i| i.consume_shortcut(&quit)) {
             self.quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        for idx in 0..self.monitors.len() {
+            let Some(shortcut) = input_shortcut(idx) else {
+                break;
+            };
+            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+                self.cycle_input(idx);
+            }
         }
 
         let mut cmds = Vec::new();
@@ -1207,6 +1258,29 @@ mod tests {
         assert_eq!(opts[1].code, 0x19);
         m.inputs.clear();
         assert_eq!(m.input_options().len(), INPUT_SOURCES.len());
+    }
+
+    #[test]
+    fn next_input_cycles_from_the_selected_option() {
+        let opt = |code| InputOption {
+            code,
+            label: input_label(code),
+        };
+        let mut m = MonitorState {
+            input: Some(0x0f),
+            inputs: vec![opt(0x0f), opt(0x11), opt(0x1b)],
+            ..Default::default()
+        };
+        assert_eq!(m.next_input(), Some(0x11));
+        m.pending_input = Some(0x11);
+        assert_eq!(m.next_input(), Some(0x1b));
+        m.pending_input = Some(0x1b);
+        assert_eq!(m.next_input(), Some(0x0f));
+        m.inputs = vec![opt(0x0f)];
+        m.pending_input = None;
+        assert_eq!(m.next_input(), None);
+        m.input = None;
+        assert_eq!(m.next_input(), None);
     }
 
     #[test]
