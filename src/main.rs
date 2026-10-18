@@ -8,6 +8,7 @@ mod tray;
 
 use ddc_hi::{Ddc, Display, FeatureCode, Handle, VcpValue};
 use eframe::egui;
+use std::collections::{BTreeMap, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -31,6 +32,11 @@ const INPUT_READBACK_DELAY: Duration = Duration::from_secs(1);
 const FOCUS_RELOAD_MIN_AGE: Duration = Duration::from_secs(2);
 /// Errors kept per monitor.
 const MAX_ERRORS: usize = 6;
+/// Storage key for the user's input names (eframe persistence).
+const INPUT_NAMES_KEY: &str = "input_names";
+
+/// User-chosen input names: monitor key → input code → name.
+type InputNames = HashMap<String, BTreeMap<u8, String>>;
 
 /// MCCS 2.x input-source codes (VCP 0x60). Used as the fallback list when the
 /// monitor's capabilities cannot be read, and for labelling.
@@ -300,14 +306,22 @@ struct InputOption {
 struct MonitorState {
     name: String,
     ident: String,
+    /// Identifies the monitor for saved settings (see [`MonitorState::probe`]).
+    key: String,
     brightness: Option<Control>,
     contrast: Option<Control>,
     /// Input reported by the monitor (VCP 0x60 SL byte); `None` if unreadable.
     input: Option<u8>,
-    /// Input selected in the dropdown but not yet sent.
+    /// Input switch sent but not yet confirmed by the monitor.
     pending_input: Option<u8>,
     /// Inputs from the capabilities string; empty until read (falls back to `INPUT_SOURCES`).
     inputs: Vec<InputOption>,
+    /// User-chosen input names, overriding the labels.
+    names: BTreeMap<u8, String>,
+    /// Input being renamed, with the name typed so far.
+    renaming: Option<(u8, String)>,
+    /// `names` changed and should be saved.
+    names_changed: bool,
     errors: Vec<String>,
     failures: u8,
 }
@@ -320,6 +334,17 @@ impl MonitorState {
             .clone()
             .or_else(|| info.model_id.map(|m| format!("model {m:#06x}")))
             .unwrap_or_else(|| "Unknown display".into());
+        // Stable across reboots and re-plugging (unlike the i2c bus number), so
+        // per-monitor settings can be keyed on it; without a serial, identical
+        // models share settings.
+        let key = [
+            info.manufacturer_id.clone().unwrap_or_default(),
+            name.clone(),
+            info.serial_number
+                .clone()
+                .unwrap_or_else(|| info.id.clone()),
+        ]
+        .join("/");
         let ident = [
             info.manufacturer_id.clone(),
             info.serial_number.clone().map(|s| format!("S/N {s}")),
@@ -335,6 +360,7 @@ impl MonitorState {
         let mut state = Self {
             name,
             ident,
+            key,
             ..Default::default()
         };
         state.read_values(&mut display.handle);
@@ -435,17 +461,39 @@ impl MonitorState {
                 label: input_label(cur),
             });
         }
+        for o in &mut options {
+            if let Some(name) = self.names.get(&o.code) {
+                o.label.clone_from(name);
+            }
+        }
         options
     }
 
-    /// The option after the selected one (pending, else current), wrapping around;
-    /// `None` if the input is unreadable or there is nothing to switch to.
-    fn next_input(&self) -> Option<u8> {
-        let selected = self.pending_input.or(self.input)?;
-        let options = self.input_options();
-        let pos = options.iter().position(|o| o.code == selected)?;
-        let next = options[(pos + 1) % options.len()].code;
-        (next != selected).then_some(next)
+    /// Label for an input ignoring the user's name: the monitor's own, else the MCCS one.
+    fn default_input_label(&self, code: u8) -> String {
+        self.inputs
+            .iter()
+            .find(|o| o.code == code)
+            .map_or_else(|| input_label(code), |o| o.label.clone())
+    }
+
+    /// Label for an input as shown to the user.
+    fn input_name(&self, code: u8) -> String {
+        self.names
+            .get(&code)
+            .cloned()
+            .unwrap_or_else(|| self.default_input_label(code))
+    }
+
+    /// Name an input; an empty (or default) name restores the default label.
+    fn rename_input(&mut self, code: u8, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name == self.default_input_label(code) {
+            self.names.remove(&code);
+        } else {
+            self.names.insert(code, name.to_string());
+        }
+        self.names_changed = true;
     }
 }
 
@@ -474,7 +522,7 @@ enum Msg {
     },
     Reloaded {
         idx: usize,
-        state: MonitorState,
+        state: Box<MonitorState>,
     },
     SetOk {
         idx: usize,
@@ -573,7 +621,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
             for (idx, display) in displays.iter_mut().enumerate() {
                 let mut state = MonitorState::default();
                 state.read_values(&mut display.handle);
-                if !post(Msg::Reloaded { idx, state }) {
+                if !post(Msg::Reloaded {
+                    idx,
+                    state: Box::new(state),
+                }) {
                     return;
                 }
             }
@@ -626,12 +677,31 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
 
 // ───────────────────────── UI ─────────────────────────
 
-/// Cmd+N (macOS) / Ctrl+N switches the Nth monitor to its next input.
-fn input_shortcut(idx: usize) -> Option<egui::KeyboardShortcut> {
+/// Shown when hovering an input: switching away can blank this screen.
+const SWITCH_HINT: &str = "Switches the monitor to this input. If this computer is not \
+                           connected to it, the monitor will stop showing it.";
+
+/// (monitor index, input code) with its Cmd+N (macOS) / Ctrl+N shortcut. Inputs
+/// are numbered across all monitors in order, so a key always means one input.
+type InputShortcut = (usize, u8, egui::KeyboardShortcut);
+
+fn input_shortcuts(monitors: &[MonitorState]) -> Vec<InputShortcut> {
     use egui::Key::*;
     const KEYS: [egui::Key; 9] = [Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9];
-    KEYS.get(idx)
-        .map(|&key| egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+    monitors
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.input.is_some())
+        .flat_map(|(idx, m)| m.input_options().into_iter().map(move |o| (idx, o.code)))
+        .zip(KEYS)
+        .map(|((idx, code), key)| {
+            (
+                idx,
+                code,
+                egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key),
+            )
+        })
+        .collect()
 }
 
 struct App {
@@ -651,6 +721,8 @@ struct App {
     hidden: bool,
     /// A real quit was requested (Ctrl+Q or tray menu); don't intercept the close.
     quit: bool,
+    /// Input names for all monitors seen, including ones not connected now.
+    input_names: InputNames,
 }
 
 impl App {
@@ -679,6 +751,10 @@ impl App {
             tray_state: (Vec::new(), false),
             hidden: false,
             quit: false,
+            input_names: cc
+                .storage
+                .and_then(|s| eframe::get_value(s, INPUT_NAMES_KEY))
+                .unwrap_or_default(),
         }
     }
 
@@ -687,23 +763,7 @@ impl App {
             match event {
                 TrayEvent::ToggleWindow => self.set_hidden(ctx, !self.hidden),
                 TrayEvent::Rescan => self.send(Cmd::Rescan),
-                TrayEvent::SetInput { idx, code } => {
-                    let switch = self.monitors.get_mut(idx).is_some_and(|m| {
-                        if m.input == Some(code) {
-                            false
-                        } else {
-                            m.pending_input = Some(code);
-                            true
-                        }
-                    });
-                    if switch {
-                        self.send(Cmd::Set {
-                            idx,
-                            code: VCP_INPUT_SOURCE,
-                            value: u16::from(code),
-                        });
-                    }
-                }
+                TrayEvent::SetInput { idx, code } => self.select_input(idx, code),
                 TrayEvent::BrightnessDelta(delta) => self.nudge_brightness(delta),
                 TrayEvent::Quit => {
                     self.quit = true;
@@ -757,25 +817,41 @@ impl App {
         }
     }
 
-    /// Keyboard shortcut: switch a monitor straight to its next input (no
-    /// separate Switch click, unlike the dropdown).
-    fn cycle_input(&mut self, idx: usize) {
+    /// Switch a monitor to an input right away (radio button, shortcut or tray menu).
+    fn select_input(&mut self, idx: usize, code: u8) {
         if self.scanning {
             return;
         }
         let Some(m) = self.monitors.get_mut(idx) else {
             return;
         };
-        if m.failures >= MAX_FAILURES {
+        if m.failures >= MAX_FAILURES
+            || m.input.is_none()
+            || m.pending_input.or(m.input) == Some(code)
+        {
             return;
         }
-        let Some(code) = m.next_input() else { return };
         m.pending_input = Some(code);
         self.send(Cmd::Set {
             idx,
             code: VCP_INPUT_SOURCE,
             value: u16::from(code),
         });
+    }
+
+    /// Take renamed inputs into the saved map and repaint so the tray picks them up.
+    fn collect_input_names(&mut self, ctx: &egui::Context) {
+        for m in &mut self.monitors {
+            if !std::mem::take(&mut m.names_changed) {
+                continue;
+            }
+            if m.names.is_empty() {
+                self.input_names.remove(&m.key);
+            } else {
+                self.input_names.insert(m.key.clone(), m.names.clone());
+            }
+            ctx.request_repaint();
+        }
     }
 
     /// Push monitor/window state to the tray menu when it changed.
@@ -812,6 +888,9 @@ impl App {
             match msg {
                 Msg::Scanned { monitors, error } => {
                     self.monitors = monitors;
+                    for m in &mut self.monitors {
+                        m.names = self.input_names.get(&m.key).cloned().unwrap_or_default();
+                    }
                     self.scan_error = error;
                     self.scanning = false;
                     self.last_read = Instant::now();
@@ -823,7 +902,7 @@ impl App {
                 }
                 Msg::Reloaded { idx, state } => {
                     if let Some(m) = self.monitors.get_mut(idx) {
-                        m.apply_reload(state);
+                        m.apply_reload(*state);
                     }
                     self.last_read = Instant::now();
                 }
@@ -844,10 +923,10 @@ impl App {
                         if let Some(actual) = readback
                             && actual != requested
                         {
+                            let (requested, actual) =
+                                (m.input_name(requested), m.input_name(actual));
                             m.push_error(format!(
-                                "input: asked for {} but monitor reports {}",
-                                input_label(requested),
-                                input_label(actual)
+                                "input: asked for {requested} but monitor reports {actual}"
                             ));
                         }
                     } else if let Some(c) = m.control_mut(code) {
@@ -864,6 +943,9 @@ impl App {
                         continue;
                     };
                     m.failures = m.failures.saturating_add(1);
+                    if code == VCP_INPUT_SOURCE {
+                        m.pending_input = None;
+                    }
                     if let Some(c) = m.control_mut(code) {
                         c.value = c.applied;
                         c.last_sent_value = None;
@@ -923,11 +1005,95 @@ fn control_row(
     ui.end_row();
 }
 
+/// A monitor's inputs as radio buttons (clicking one switches), each with its
+/// shortcut and a rename button.
+fn input_list(
+    ui: &mut egui::Ui,
+    idx: usize,
+    m: &mut MonitorState,
+    current: u8,
+    enabled: bool,
+    shortcuts: &[InputShortcut],
+    select: &mut Option<(usize, u8)>,
+) {
+    let selected = m.pending_input.unwrap_or(current);
+    let rename_id = egui::Id::new(("rename-input", idx));
+    egui::Grid::new(("inputs", idx))
+        .num_columns(3)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            for o in m.input_options() {
+                match m.renaming.take() {
+                    Some((code, mut draft)) if code == o.code => {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut draft)
+                                .id(rename_id)
+                                .hint_text(m.default_input_label(code))
+                                .desired_width(140.0),
+                        );
+                        let enter =
+                            edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let save = ui
+                            .small_button("✔")
+                            .on_hover_text("Save name (Enter)")
+                            .clicked();
+                        let cancel = ui.small_button("✖").on_hover_text("Cancel (Esc)").clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if cancel {
+                            // Dropped: back to the radio button.
+                        } else if save || enter {
+                            m.rename_input(code, &draft);
+                        } else {
+                            m.renaming = Some((code, draft));
+                        }
+                    }
+                    renaming => {
+                        m.renaming = renaming;
+                        ui.horizontal(|ui| {
+                            let radio = ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::RadioButton::new(o.code == selected, &o.label),
+                                )
+                                .on_hover_text(SWITCH_HINT);
+                            if radio.clicked() {
+                                *select = Some((idx, o.code));
+                            }
+                            if m.pending_input == Some(o.code) {
+                                ui.add(egui::Spinner::new().size(12.0))
+                                    .on_hover_text("Switching…");
+                            }
+                        });
+                        match shortcuts.iter().find(|(i, c, _)| *i == idx && *c == o.code) {
+                            Some((_, _, shortcut)) => {
+                                ui.weak(ui.ctx().format_shortcut(shortcut));
+                            }
+                            None => {
+                                ui.label("");
+                            }
+                        }
+                        if ui
+                            .small_button("✏")
+                            .on_hover_text("Rename this input")
+                            .clicked()
+                        {
+                            m.renaming = Some((o.code, m.input_name(o.code)));
+                            ui.memory_mut(|mem| mem.request_focus(rename_id));
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+}
+
 fn monitor_ui(
     ui: &mut egui::Ui,
     idx: usize,
     m: &mut MonitorState,
     scanning: bool,
+    shortcuts: &[InputShortcut],
+    select: &mut Option<(usize, u8)>,
     cmds: &mut Vec<Cmd>,
 ) {
     let locked_out = m.failures >= MAX_FAILURES;
@@ -976,46 +1142,14 @@ fn monitor_ui(
                     );
 
                     ui.label("🔌 Input");
-                    ui.horizontal(|ui| match m.input {
+                    match m.input {
                         None => {
                             ui.weak("unavailable");
                         }
                         Some(current) => {
-                            let options = m.input_options();
-                            let mut selected = m.pending_input.unwrap_or(current);
-                            ui.add_enabled_ui(enabled, |ui| {
-                                egui::ComboBox::from_id_salt(("input", idx))
-                                    .selected_text(input_label(selected))
-                                    .show_ui(ui, |ui| {
-                                        for o in &options {
-                                            ui.selectable_value(&mut selected, o.code, &o.label);
-                                        }
-                                    });
-                            });
-                            m.pending_input = (selected != current).then_some(selected);
-                            let switch = ui
-                                .add_enabled(
-                                    enabled && m.pending_input.is_some(),
-                                    egui::Button::new("Switch"),
-                                )
-                                .on_hover_text(
-                                    "Sends the input change to the monitor. If this computer is \
-                                     not connected to the new input, the monitor will stop \
-                                     showing it.",
-                                );
-                            if switch.clicked() {
-                                cmds.push(Cmd::Set {
-                                    idx,
-                                    code: VCP_INPUT_SOURCE,
-                                    value: selected as u16,
-                                });
-                            }
-                            if let Some(shortcut) = input_shortcut(idx) {
-                                ui.weak(ui.ctx().format_shortcut(&shortcut))
-                                    .on_hover_text("Switch to the next input");
-                            }
+                            input_list(ui, idx, m, current, enabled, shortcuts, select);
                         }
-                    });
+                    }
                     ui.end_row();
                 });
 
@@ -1082,16 +1216,15 @@ impl eframe::App for App {
             self.quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        for idx in 0..self.monitors.len() {
-            let Some(shortcut) = input_shortcut(idx) else {
-                break;
-            };
-            if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
-                self.cycle_input(idx);
+        let shortcuts = input_shortcuts(&self.monitors);
+        for (idx, code, shortcut) in &shortcuts {
+            if ctx.input_mut(|i| i.consume_shortcut(shortcut)) {
+                self.select_input(*idx, *code);
             }
         }
 
         let mut cmds = Vec::new();
+        let mut select = None;
         let visuals = ctx.style().visuals.clone();
 
         egui::TopBottomPanel::top("toolbar")
@@ -1169,7 +1302,7 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         let scanning = self.scanning;
                         for (idx, m) in self.monitors.iter_mut().enumerate() {
-                            monitor_ui(ui, idx, m, scanning, &mut cmds);
+                            monitor_ui(ui, idx, m, scanning, &shortcuts, &mut select, &mut cmds);
                             ui.add_space(10.0);
                         }
                     });
@@ -1178,6 +1311,14 @@ impl eframe::App for App {
         for cmd in cmds {
             self.send(cmd);
         }
+        if let Some((idx, code)) = select {
+            self.select_input(idx, code);
+        }
+        self.collect_input_names(ctx);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, INPUT_NAMES_KEY, &self.input_names);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1261,26 +1402,57 @@ mod tests {
     }
 
     #[test]
-    fn next_input_cycles_from_the_selected_option() {
+    fn shortcuts_number_inputs_across_monitors() {
         let opt = |code| InputOption {
             code,
             label: input_label(code),
         };
-        let mut m = MonitorState {
-            input: Some(0x0f),
-            inputs: vec![opt(0x0f), opt(0x11), opt(0x1b)],
+        let monitor = |input, inputs| MonitorState {
+            input,
+            inputs,
             ..Default::default()
         };
-        assert_eq!(m.next_input(), Some(0x11));
-        m.pending_input = Some(0x11);
-        assert_eq!(m.next_input(), Some(0x1b));
-        m.pending_input = Some(0x1b);
-        assert_eq!(m.next_input(), Some(0x0f));
-        m.inputs = vec![opt(0x0f)];
-        m.pending_input = None;
-        assert_eq!(m.next_input(), None);
-        m.input = None;
-        assert_eq!(m.next_input(), None);
+        let monitors = [
+            monitor(Some(0x0F), vec![opt(0x0F), opt(0x11)]),
+            // Unreadable input: no radio buttons, so no shortcuts.
+            monitor(None, vec![opt(0x0F)]),
+            monitor(Some(0x11), vec![opt(0x11), opt(0x19)]),
+        ];
+        let slots: Vec<_> = input_shortcuts(&monitors)
+            .into_iter()
+            .map(|(idx, code, s)| (idx, code, s.logical_key))
+            .collect();
+        assert_eq!(
+            slots,
+            [
+                (0, 0x0F, egui::Key::Num1),
+                (0, 0x11, egui::Key::Num2),
+                (2, 0x11, egui::Key::Num3),
+                (2, 0x19, egui::Key::Num4),
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_input_names_override_labels() {
+        let mut m = MonitorState {
+            inputs: vec![InputOption {
+                code: 0x0F,
+                label: "DisplayPort-1".into(),
+            }],
+            input: Some(0x0F),
+            ..Default::default()
+        };
+        m.rename_input(0x0F, "  Work laptop ");
+        assert_eq!(m.input_name(0x0F), "Work laptop");
+        assert_eq!(m.input_options()[0].label, "Work laptop");
+        assert_eq!(m.default_input_label(0x0F), "DisplayPort-1");
+        assert!(m.names_changed);
+        // Clearing the name, or typing the default, restores the default label.
+        m.rename_input(0x0F, "");
+        assert_eq!(m.input_name(0x0F), "DisplayPort-1");
+        m.rename_input(0x0F, "DisplayPort-1");
+        assert!(m.names.is_empty());
     }
 
     #[test]

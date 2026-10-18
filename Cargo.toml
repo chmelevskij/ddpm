@@ -7,7 +7,7 @@ repository = "https://github.com/chmelevskij/ddpm"
 license = "MIT"
 
 [dependencies]
-eframe = "0.31"
+eframe = { version = "0.31", features = ["persistence"] }
 ddc-hi = "0.4"
 env_logger = "0.11"
 log = "0.4"

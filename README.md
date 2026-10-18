@@ -16,8 +16,9 @@ Monitor control for Linux and macOS — adjust **brightness**, **contrast** and 
 ## Features
 
 - Per-monitor brightness and contrast sliders — writes are throttled and coalesced, and the UI never blocks on the slow DDC/i2c protocol (all I/O runs on a worker thread)
-- Input-source switching (DisplayPort / HDMI / USB-C / …) — the list comes from the monitor's own capabilities, and switching is a deliberate two-step action with read-back
-- Keyboard shortcuts: ⌘1…⌘9 (Ctrl+1…9 on Linux) switch monitor 1…9 straight to its next input while the window is focused
+- Input-source switching (DisplayPort / HDMI / USB-C / …) — each monitor lists its inputs as radio buttons (from the monitor's own capabilities); clicking one switches, with read-back
+- Name your inputs (✏ next to each input, e.g. "Work laptop" instead of "DisplayPort-1"); names are remembered per monitor and also show in the tray / menu bar menu
+- Keyboard shortcuts: every input gets one, ⌘1…⌘9 (Ctrl+1…9 on Linux), numbered across all monitors and shown next to the input; they work while the window is focused
 - System tray icon (Linux: StatusNotifierItem, like the network/volume applets): scroll on it to adjust brightness, switch inputs straight from its menu, and closing the window hides to the tray — quit from the tray menu or with Ctrl+Q (on Wayland, restore the window from the taskbar; compositors don't let apps unminimize themselves)
 - macOS menu bar icon: switch inputs, show/hide the window, rescan or quit from its menu (no scroll-to-adjust; macOS status items don't get scroll events)
 - Rescan for hot-plugged monitors; values re-read on window focus, so changes made via the monitor OSD or `ddcutil` stay in sync
