@@ -318,8 +318,9 @@ struct MonitorState {
     inputs: Vec<InputOption>,
     /// User-chosen input names, overriding the labels.
     names: BTreeMap<u8, String>,
-    /// Input being renamed, with the name typed so far.
-    renaming: Option<(u8, String)>,
+    /// Input being renamed, the name typed so far, and whether the text box
+    /// still has to take focus (it only exists from the next frame on).
+    renaming: Option<(u8, String, bool)>,
     /// `names` changed and should be saved.
     names_changed: bool,
     errors: Vec<String>,
@@ -1017,20 +1018,23 @@ fn input_list(
     select: &mut Option<(usize, u8)>,
 ) {
     let selected = m.pending_input.unwrap_or(current);
-    let rename_id = egui::Id::new(("rename-input", idx));
     egui::Grid::new(("inputs", idx))
         .num_columns(3)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
             for o in m.input_options() {
                 match m.renaming.take() {
-                    Some((code, mut draft)) if code == o.code => {
+                    Some((code, mut draft, focus)) if code == o.code => {
                         let edit = ui.add(
                             egui::TextEdit::singleline(&mut draft)
-                                .id(rename_id)
                                 .hint_text(m.default_input_label(code))
                                 .desired_width(140.0),
                         );
+                        // Focus through the response: requesting focus for an id with no
+                        // widget yet makes accesskit panic (focused node not in tree).
+                        if focus {
+                            edit.request_focus();
+                        }
                         let enter =
                             edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let save = ui
@@ -1039,12 +1043,14 @@ fn input_list(
                             .clicked();
                         let cancel = ui.small_button("✖").on_hover_text("Cancel (Esc)").clicked()
                             || ui.input(|i| i.key_pressed(egui::Key::Escape));
-                        if cancel {
-                            // Dropped: back to the radio button.
-                        } else if save || enter {
-                            m.rename_input(code, &draft);
+                        if cancel || save || enter {
+                            // The text box goes away; drop its focus now for the same reason.
+                            edit.surrender_focus();
+                            if !cancel {
+                                m.rename_input(code, &draft);
+                            }
                         } else {
-                            m.renaming = Some((code, draft));
+                            m.renaming = Some((code, draft, false));
                         }
                     }
                     renaming => {
@@ -1077,8 +1083,7 @@ fn input_list(
                             .on_hover_text("Rename this input")
                             .clicked()
                         {
-                            m.renaming = Some((o.code, m.input_name(o.code)));
-                            ui.memory_mut(|mem| mem.request_focus(rename_id));
+                            m.renaming = Some((o.code, m.input_name(o.code), true));
                         }
                     }
                 }
