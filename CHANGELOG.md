@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/chmelevskij/ddpm/compare/v0.1.0...v0.2.0) - 2026-10-18
+
+### Added
+
+- radio-button input list with custom names and per-input shortcuts
+- keyboard shortcuts to cycle monitor inputs
+- macOS support
+- add system tray icon with scroll brightness and input switching
+
+### Fixed
+
+- crash when renaming an input
+
+### Other
+
+- make `just install` work on macOS
+- install libudev-dev for release-plz cargo package
+- fix release-plz version detection for unpublished crate
+- add MIT license
+- release v0.1.0 ([#1](https://github.com/chmelevskij/ddpm/pull/1))
+- suffix f32 literals in Stroke::new for newer clippy
+
 ## [0.1.0](https://github.com/chmelevskij/ddpm/releases/tag/v0.1.0) - 2026-08-31
 
 ### Other
