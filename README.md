@@ -19,6 +19,7 @@ Monitor control for Linux and macOS — adjust **brightness**, **contrast** and 
 - Input-source switching (DisplayPort / HDMI / USB-C / …) — each monitor lists its inputs as radio buttons (from the monitor's own capabilities); clicking one switches, with read-back
 - Name your inputs (✏ next to each input, e.g. "Work laptop" instead of "DisplayPort-1"); names are remembered per monitor and also show in the tray / menu bar menu
 - Keyboard shortcuts: every input gets one, ⌘1…⌘9 (Ctrl+1…9 on Linux), numbered across all monitors and shown next to the input; they work while the window is focused
+- Brightness keys and scripting: `ddpm brightness +5` / `-5` steps all monitors of the running app, even while it is minimized; `ddpm shortcuts install` binds the keyboard's brightness keys to it on KDE Plasma
 - System tray icon (Linux: StatusNotifierItem, like the network/volume applets): scroll on it to adjust brightness, switch inputs straight from its menu, and closing the window hides to the tray — quit from the tray menu or with Ctrl+Q (on Wayland, restore the window from the taskbar; compositors don't let apps unminimize themselves)
 - macOS menu bar icon: switch inputs, show/hide the window, rescan or quit from its menu (no scroll-to-adjust; macOS status items don't get scroll events)
 - Rescan for hot-plugged monitors; values re-read on window focus, so changes made via the monitor OSD or `ddcutil` stay in sync
@@ -53,6 +54,21 @@ just uninstall   # remove it again
 ```
 
 `just install-system` / `just uninstall-system` (sudo, `/usr/local`) are Linux-only.
+
+## Brightness keys
+
+With ddpm running, `ddpm brightness +5` and `ddpm brightness -5` step the brightness of every monitor (any signed step works). They only reach a running app, so keep it open or minimized to the tray.
+
+On KDE Plasma, bind the keyboard's brightness keys in one go:
+
+```sh
+ddpm shortcuts install     # takes the keys over from PowerDevil
+ddpm shortcuts uninstall   # gives them back
+```
+
+The shortcuts point at the binary you ran `install` from, so run it from the installed `ddpm`, and again if you move it. `just uninstall` cleans them up too. Note that PowerDevil's keys also control the backlight of laptop screens, which stops working until you uninstall.
+
+On other desktops, `ddpm shortcuts install` won't change anything; bind the two commands above in your desktop's keyboard settings.
 
 ## First-time system setup (Linux)
 

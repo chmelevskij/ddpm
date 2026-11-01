@@ -88,6 +88,7 @@ install:
 # Remove the user install
 [linux]
 uninstall:
+    -"{{bindir}}/{{bin}}" shortcuts uninstall
     -cargo uninstall {{bin}} --root "{{install_root}}"
     rm -f "{{appdir}}/{{bin}}.desktop"
     -update-desktop-database "{{appdir}}" 2>/dev/null

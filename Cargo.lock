@@ -951,7 +951,9 @@ dependencies = [
  "env_logger",
  "ksni",
  "log",
+ "serde",
  "tray-icon",
+ "zbus 5.19.0",
 ]
 
 [[package]]

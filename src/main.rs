@@ -4,6 +4,9 @@
 //! display handles; the UI thread only exchanges messages with it, so the
 //! window never blocks on the (slow, sleep-heavy) i2c protocol.
 
+#[cfg(unix)]
+mod ipc;
+mod shortcuts;
 mod tray;
 
 use ddc_hi::{Ddc, Display, FeatureCode, Handle, VcpValue};
@@ -95,6 +98,13 @@ fn i2c_device_path(rdev: &str) -> Option<String> {
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
     let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
     (major == 89).then(|| format!("/dev/i2c-{minor}"))
+}
+
+/// `value` moved by `delta`, staying within `0..=max`.
+fn stepped(value: u16, max: u16, delta: i32) -> u16 {
+    i32::from(value)
+        .saturating_add(delta)
+        .clamp(0, i32::from(max)) as u16
 }
 
 fn format_value(v: f64, max: u16) -> String {
@@ -211,7 +221,57 @@ fn notice(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
     });
 }
 
+const USAGE: &str = "\
+usage: ddpm                        open the app
+       ddpm brightness (+N|-N)     step brightness on all monitors of the running app
+       ddpm shortcuts install      bind the keyboard's brightness keys to ddpm (KDE Plasma)
+       ddpm shortcuts uninstall    remove that binding";
+
+/// Parse `+N` or `-N`. The sign is required so a bare number stays free to mean
+/// an absolute level later on.
+fn parse_step(arg: &str) -> Option<i32> {
+    arg.starts_with(['+', '-'])
+        .then(|| arg.parse().ok())
+        .flatten()
+}
+
+/// Handle a command-line invocation (anything other than opening the app).
+fn run_cli(args: &[&str]) -> Result<(), String> {
+    match args {
+        ["brightness", step] => {
+            let delta = parse_step(step).ok_or_else(|| USAGE.to_string())?;
+            send_brightness(delta)
+        }
+        ["shortcuts", "install"] => shortcuts::install(),
+        ["shortcuts", "uninstall"] => shortcuts::uninstall(),
+        ["-h" | "--help" | "help"] => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        _ => Err(USAGE.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn send_brightness(delta: i32) -> Result<(), String> {
+    ipc::send_brightness(delta).map_err(|e| format!("is ddpm running? {e}"))
+}
+
+#[cfg(not(unix))]
+fn send_brightness(_delta: i32) -> Result<(), String> {
+    Err("the brightness command is not supported on this platform".into())
+}
+
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if let Err(e) = run_cli(&args) {
+            eprintln!("ddpm: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,ddpm=info"))
         .init();
     let options = eframe::NativeOptions {
@@ -251,6 +311,19 @@ fn write_vcp(handle: &mut Handle, code: FeatureCode, value: u16) -> Result<(), S
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(_) => Err("DDC layer panicked".into()),
     }
+}
+
+/// Step brightness from what the monitor reports right now, which also picks up
+/// changes made through its OSD. Returns the new value.
+fn nudge_display(handle: &mut Handle, delta: i32) -> Result<u16, String> {
+    let current = read_vcp(handle, VCP_BRIGHTNESS)?;
+    let max = current.maximum();
+    if max == 0 {
+        return Err("monitor reported a maximum of 0".into());
+    }
+    let target = stepped(current.value().min(max), max, delta);
+    write_vcp(handle, VCP_BRIGHTNESS, target)?;
+    Ok(target)
 }
 
 /// Input sources advertised by the monitor's capabilities string, if readable.
@@ -506,6 +579,8 @@ enum Cmd {
         code: FeatureCode,
         value: u16,
     },
+    /// Step brightness on all monitors, without going through the UI thread.
+    Nudge { delta: i32 },
     /// Re-read values on the existing handles.
     Reload,
     /// Re-enumerate monitors.
@@ -538,6 +613,10 @@ enum Msg {
         value: u16,
         err: String,
     },
+    Nudged {
+        idx: usize,
+        result: Result<u16, String>,
+    },
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -546,6 +625,8 @@ struct Batch {
     reload: bool,
     /// Latest value per (monitor, feature), in first-seen order.
     sets: Vec<(usize, FeatureCode, u16)>,
+    /// Sum of queued brightness steps.
+    nudge: i32,
 }
 
 /// Collapse a burst of queued commands: keep only the newest value per control.
@@ -555,6 +636,7 @@ fn coalesce(cmds: impl IntoIterator<Item = Cmd>) -> Batch {
         match cmd {
             Cmd::Rescan => batch.rescan = true,
             Cmd::Reload => batch.reload = true,
+            Cmd::Nudge { delta } => batch.nudge = batch.nudge.saturating_add(delta),
             Cmd::Set { idx, code, value } => {
                 match batch
                     .sets
@@ -616,6 +698,14 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
             };
             if !post(msg) {
                 return;
+            }
+        }
+        if batch.nudge != 0 {
+            for (idx, display) in displays.iter_mut().enumerate() {
+                let result = nudge_display(&mut display.handle, batch.nudge);
+                if !post(Msg::Nudged { idx, result }) {
+                    return;
+                }
             }
         }
         if batch.reload {
@@ -730,6 +820,8 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (msg_tx, msg_rx) = mpsc::channel();
+        #[cfg(unix)]
+        ipc::spawn(cmd_tx.clone());
         apply_style(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         thread::Builder::new()
@@ -800,8 +892,7 @@ impl App {
             let Some(c) = m.brightness.as_mut() else {
                 continue;
             };
-            let target = (i32::from(c.value) + delta).clamp(0, i32::from(c.max)) as u16;
-            c.value = target;
+            c.value = stepped(c.value, c.max, delta);
             let stale = c.value != c.applied || c.last_sent_value.is_some_and(|v| v != c.value);
             if stale && c.last_sent_value != Some(c.value) {
                 c.last_sent_value = Some(c.value);
@@ -955,6 +1046,25 @@ impl App {
                         "{}: could not set {value}: {err}",
                         feature_name(code)
                     ));
+                }
+                Msg::Nudged { idx, result } => {
+                    let Some(m) = self.monitors.get_mut(idx) else {
+                        continue;
+                    };
+                    match result {
+                        Ok(value) => {
+                            m.failures = 0;
+                            if let Some(c) = m.brightness.as_mut() {
+                                c.value = value;
+                                c.applied = value;
+                                c.last_sent_value = None;
+                            }
+                        }
+                        Err(err) => {
+                            m.failures = m.failures.saturating_add(1);
+                            m.push_error(format!("brightness: {err}"));
+                        }
+                    }
                 }
             }
         }
@@ -1354,6 +1464,32 @@ mod tests {
     }
 
     #[test]
+    fn stepping_stays_in_range() {
+        assert_eq!(stepped(50, 100, 5), 55);
+        assert_eq!(stepped(3, 100, -5), 0);
+        assert_eq!(stepped(98, 100, 5), 100);
+        assert_eq!(stepped(50, 100, i32::MAX), 100);
+    }
+
+    #[test]
+    fn steps_need_a_sign() {
+        assert_eq!(parse_step("+5"), Some(5));
+        assert_eq!(parse_step("-5"), Some(-5));
+        assert_eq!(parse_step("5"), None);
+        assert_eq!(parse_step("+x"), None);
+    }
+
+    #[test]
+    fn coalesce_sums_brightness_steps() {
+        let batch = coalesce([
+            Cmd::Nudge { delta: 5 },
+            Cmd::Nudge { delta: 5 },
+            Cmd::Nudge { delta: -5 },
+        ]);
+        assert_eq!(batch.nudge, 5);
+    }
+
+    #[test]
     fn value_formatting() {
         assert_eq!(format_value(42.0, 100), "42%");
         assert_eq!(format_value(128.0, 255), "128 / 255");
@@ -1385,6 +1521,7 @@ mod tests {
                 rescan: false,
                 reload: true,
                 sets: vec![(0, VCP_BRIGHTNESS, 30), (1, VCP_CONTRAST, 50)],
+                nudge: 0,
             }
         );
     }
