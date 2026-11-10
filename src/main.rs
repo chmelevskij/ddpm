@@ -30,6 +30,9 @@ const DRAG_WRITE_INTERVAL: Duration = Duration::from_millis(150);
 const INPUT_READBACK_DELAY: Duration = Duration::from_secs(1);
 /// Do not re-read values on focus gain if they were read more recently than this.
 const FOCUS_RELOAD_MIN_AGE: Duration = Duration::from_secs(2);
+/// Input after this long without any counts as "coming back" to the window and
+/// re-syncs too: after a KVM switch or sleep the window often never lost focus.
+const IDLE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 /// Errors kept per monitor.
 const MAX_ERRORS: usize = 6;
 /// Storage key for the user's input names (eframe persistence).
@@ -422,6 +425,12 @@ impl MonitorState {
         }
     }
 
+    /// Nothing could be read: the handle is most likely stale (on macOS the
+    /// IOAVService goes away on sleep or when the monitor switches inputs).
+    fn unreachable(&self) -> bool {
+        self.brightness.is_none() && self.contrast.is_none() && self.input.is_none()
+    }
+
     fn control_mut(&mut self, code: FeatureCode) -> Option<&mut Control> {
         match code {
             VCP_BRIGHTNESS => self.brightness.as_mut(),
@@ -506,7 +515,7 @@ enum Cmd {
         code: FeatureCode,
         value: u16,
     },
-    /// Re-read values on the existing handles.
+    /// Re-read values; re-enumerates if the handles turn out to be stale.
     Reload,
     /// Re-enumerate monitors.
     Rescan,
@@ -577,7 +586,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
         ok
     };
 
-    let mut displays = scan(&post);
+    // Advertised inputs per monitor key, so automatic re-enumeration skips the
+    // slow capabilities read.
+    let mut caps = HashMap::new();
+    let mut displays = scan(&post, &mut caps);
     while let Ok(first) = rx.recv() {
         let mut cmds = vec![first];
         while let Ok(c) = rx.try_recv() {
@@ -587,7 +599,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
 
         if batch.rescan {
             // Queued sets refer to indices that may no longer be valid; drop them.
-            displays = scan(&post);
+            // An explicit rescan re-reads capabilities too.
+            caps.clear();
+            displays = scan(&post, &mut caps);
             continue;
         }
         for (idx, code, value) in batch.sets {
@@ -619,9 +633,22 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
             }
         }
         if batch.reload {
-            for (idx, display) in displays.iter_mut().enumerate() {
-                let mut state = MonitorState::default();
-                state.read_values(&mut display.handle);
+            let states: Vec<MonitorState> = displays
+                .iter_mut()
+                .map(|display| {
+                    let mut state = MonitorState::default();
+                    state.read_values(&mut display.handle);
+                    state
+                })
+                .collect();
+            // Stale handles (sleep, KVM switch, re-plug) or a monitor that was
+            // missing: re-reading the old handles can't recover, so re-enumerate.
+            if states.is_empty() || states.iter().any(MonitorState::unreachable) {
+                log::info!("monitor handles look stale; re-enumerating");
+                displays = scan(&post, &mut caps);
+                continue;
+            }
+            for (idx, state) in states.into_iter().enumerate() {
                 if !post(Msg::Reloaded {
                     idx,
                     state: Box::new(state),
@@ -633,8 +660,9 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context) {
     }
 }
 
-/// Enumerate monitors and read their values; then (slowly) read capabilities.
-fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
+/// Enumerate monitors and read their values; then (slowly) read capabilities
+/// for monitors not already in `caps`.
+fn scan(post: &dyn Fn(Msg) -> bool, caps: &mut HashMap<String, Vec<InputOption>>) -> Vec<Display> {
     let mut displays = match catch_unwind(Display::enumerate) {
         Ok(d) => d,
         Err(_) => {
@@ -642,7 +670,13 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
             Vec::new()
         }
     };
-    let monitors: Vec<MonitorState> = displays.iter_mut().map(MonitorState::probe).collect();
+    let mut monitors: Vec<MonitorState> = displays.iter_mut().map(MonitorState::probe).collect();
+    for m in &mut monitors {
+        if let Some(inputs) = caps.get(&m.key) {
+            m.inputs.clone_from(inputs);
+        }
+    }
+    let keys: Vec<String> = monitors.iter().map(|m| m.key.clone()).collect();
     for m in &monitors {
         log::info!(
             "found {} ({}): brightness={:?} contrast={:?} input={:?}",
@@ -658,7 +692,10 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
         return displays;
     }
     // Capabilities are a slow multi-fragment read; deliver them after the first paint.
-    for (idx, display) in displays.iter_mut().enumerate() {
+    for (idx, (display, key)) in displays.iter_mut().zip(keys).enumerate() {
+        if caps.contains_key(&key) {
+            continue;
+        }
         if let Some(inputs) = supported_inputs(&mut display.handle) {
             log::info!(
                 "monitor {idx} advertises inputs: {}",
@@ -668,6 +705,7 @@ fn scan(post: &dyn Fn(Msg) -> bool) -> Vec<Display> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            caps.insert(key, inputs.clone());
             if !post(Msg::Inputs { idx, inputs }) {
                 break;
             }
@@ -714,6 +752,8 @@ struct App {
     worker_error: Option<String>,
     was_focused: bool,
     last_read: Instant,
+    /// Last pointer/keyboard input in the window.
+    last_activity: Instant,
     tray: Option<Tray>,
     tray_rx: Receiver<TrayEvent>,
     /// Last (monitors, hidden) pushed to the tray, to skip needless menu rebuilds.
@@ -747,6 +787,7 @@ impl App {
             worker_error: None,
             was_focused: true,
             last_read: Instant::now(),
+            last_activity: Instant::now(),
             tray,
             tray_rx,
             tray_state: (Vec::new(), false),
@@ -1200,15 +1241,27 @@ impl eframe::App for App {
             self.set_hidden(ctx, true);
         }
 
-        // Re-read values when the window regains focus (OSD / other tools may have changed them).
+        // Re-sync with the monitors when the user comes back to the window: the
+        // OSD, a KVM or another machine may have switched them, and after sleep
+        // the handles need re-enumerating (the worker does that on Reload).
         let focused = ctx.input(|i| i.focused);
-        if focused
-            && !self.was_focused
-            && !self.scanning
-            && !self.monitors.is_empty()
-            && self.last_read.elapsed() >= FOCUS_RELOAD_MIN_AGE
-        {
+        let active = focused
+            && ctx.input(|i| {
+                i.pointer.is_moving()
+                    || i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key { .. } | egui::Event::PointerButton { .. }
+                        )
+                    })
+            });
+        let came_back = (focused && !self.was_focused)
+            || (active && self.last_activity.elapsed() >= IDLE_REFRESH_AFTER);
+        if came_back && !self.scanning && self.last_read.elapsed() >= FOCUS_RELOAD_MIN_AGE {
             self.send(Cmd::Reload);
+        }
+        if active {
+            self.last_activity = Instant::now();
         }
         self.was_focused = focused;
         if focused {
@@ -1458,6 +1511,14 @@ mod tests {
         assert_eq!(m.input_name(0x0F), "DisplayPort-1");
         m.rename_input(0x0F, "DisplayPort-1");
         assert!(m.names.is_empty());
+    }
+
+    #[test]
+    fn unreachable_only_when_nothing_was_read() {
+        let mut m = MonitorState::default();
+        assert!(m.unreachable());
+        m.input = Some(0x0F);
+        assert!(!m.unreachable());
     }
 
     #[test]
